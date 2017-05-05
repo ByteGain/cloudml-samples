@@ -64,6 +64,9 @@ def process_args():
       '--cloud', action='store_true',
       help='Run preprocessing on the cloud.')
   parser.add_argument(
+      '--debug_run', action='store_true',
+      help='Stop after preprocessing')
+  parser.add_argument(
       '--train_input_path',
       default=None,
       help='Input specified as uri to CSV file for the train set')
@@ -236,6 +239,8 @@ class FlowersE2E(object):
     vars(args)['input_path'] = input_csv
     vars(args)['input_dict'] = self.args.input_dict
     vars(args)['output_path'] = output_prefix
+    vars(args)['distort_images'] = (dataset_name == 'train')
+    
     # execute the pipeline
     with beam.Pipeline(pipeline_name, options=opts) as pipeline:
       preprocess_lib.configure_pipeline(pipeline, args)
@@ -251,7 +256,8 @@ class FlowersE2E(object):
         '--output_path', self.args.output_dir,
         '--eval_data_paths', eval_file_path,
         '--eval_set_size', str(self.args.eval_set_size),
-        '--train_data_paths', train_file_path
+        '--train_data_paths', train_file_path,
+        '--max_steps', "5000",
     ]
 
     if self.args.cloud:
@@ -317,6 +323,7 @@ class FlowersE2E(object):
        It keeps sending online prediction requests until a prediction is
        successful or maximum wait time is reached. It sleeps between requests.
     """
+    print("adaptive_wait!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     start_time = datetime.datetime.utcnow()
     elapsed_time = 0
     while elapsed_time < self.args.max_deploy_wait_time:
@@ -379,6 +386,9 @@ class FlowersE2E(object):
 
       if not train_prefix or not eval_prefix:
         train_prefix, eval_prefix = self.preprocess()
+      if self.args.debug_run:
+        print("Exiting after preprocess for --debug_run")
+        return
       self.train(train_prefix + '*', eval_prefix + '*')
       model_path = os.path.join(self.args.output_dir, EXPORT_SUBDIRECTORY)
     self.deploy_model(model_path)

@@ -104,6 +104,7 @@ class Default(object):
   # inception graph or when a newer checkpoint file is available. See
   # https://research.googleblog.com/2016/08/improving-inception-and-image.html
   IMAGE_GRAPH_CHECKPOINT_URI = (
+#       '/Users/mtv/data3/9gag/inception_v3_2016_08_28.ckpt')
       'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt')
 
 
@@ -133,8 +134,9 @@ class ExtractLabelIdsDoFn(beam.DoFn):
 
     csv_rows_count.inc()
     uri = row[0]
-    if not uri or not uri.startswith('gs://'):
+    if not uri or not (uri.startswith('gs://') or uri.startswith('file://')):
       invalid_uri.inc()
+      print("invalid uri " + str(uri))
       return
 
     # In a real-world system, you may want to provide a default id for labels
@@ -173,8 +175,10 @@ class ReadImageAndConvertToJpegDoFn(beam.DoFn):
       try:
         return file_io.FileIO(uri, mode='rb')
       except errors.InvalidArgumentError:
+        print("error reading file %s" % uri)
         return file_io.FileIO(uri, mode='r')
 
+    print("read %s" % uri)
     try:
       with _open_file_read_binary(uri) as f:
         image_bytes = f.read()
@@ -183,7 +187,7 @@ class ReadImageAndConvertToJpegDoFn(beam.DoFn):
     # A variety of different calling libraries throw different exceptions here.
     # They all correspond to an unreadable file so we treat them equivalently.
     except Exception as e:  # pylint: disable=broad-except
-      logging.exception('Error processing image %s: %s', uri, str(e))
+      print('Error processing image %s: %s' % (uri, str(e)))
       error_count.inc()
       return
 
@@ -207,12 +211,140 @@ class EmbeddingsGraph(object):
     self.tf_session = tf_session
     # input_jpeg is the tensor that contains raw image bytes.
     # It is used to feed image bytes and obtain embeddings.
-    self.input_jpeg, self.embedding = self.build_graph()
+    self.input_jpeg, self.distorted_version, self.embedding = self.build_graph()
 
     init_op = tf.global_variables_initializer()
     self.tf_session.run(init_op)
     self.restore_from_checkpoint(Default.IMAGE_GRAPH_CHECKPOINT_URI)
 
+
+  # distort_color is copied and possibly modified from
+  # inception/inception/image_processing.py under
+  # http://www.apache.org/licenses/LICENSE-2.0
+  def distort_color(self, image, thread_id=0, scope=None):
+    """Distort the color of the image.
+
+    Each color distortion is non-commutative and thus ordering of the color ops
+    matters. Ideally we would randomly permute the ordering of the color ops.
+    Rather then adding that level of complication, we select a distinct ordering
+    of color ops for each preprocessing thread.
+
+    Args:
+      image: Tensor containing single image.
+      thread_id: preprocessing thread ID.
+      scope: Optional scope for name_scope.
+    Returns:
+      color-distorted image
+    """
+    with tf.name_scope(values=[image], name=scope, default_name='distort_color'):
+      color_ordering = thread_id % 2
+
+      if color_ordering == 0:
+        image = tf.image.random_brightness(image, max_delta=32. / 255.)
+        image = tf.image.random_saturation(image, lower=0.5, upper=1.5)
+        image = tf.image.random_hue(image, max_delta=0.2)
+        image = tf.image.random_contrast(image, lower=0.5, upper=1.5)
+      elif color_ordering == 1:
+        image = tf.image.random_brightness(image, max_delta=32. / 255.)
+        image = tf.image.random_contrast(image, lower=0.5, upper=1.5)
+        image = tf.image.random_saturation(image, lower=0.5, upper=1.5)
+        image = tf.image.random_hue(image, max_delta=0.2)
+
+      # The random_* ops do not necessarily clamp.
+      image = tf.clip_by_value(image, 0.0, 1.0)
+      return image
+
+
+  # distort_image is copied and possibly modified from
+  # inception/inception/image_processing.py under
+  # http://www.apache.org/licenses/LICENSE-2.0
+  def distort_image(self, image, height, width, bbox, thread_id=0, scope=None):
+    """Distort one image for training a network.
+
+    Distorting images provides a useful technique for augmenting the data
+    set during training in order to make the network invariant to aspects
+    of the image that do not effect the label.
+
+    Args:
+      image: 3-D float Tensor of image
+      height: integer
+      width: integer
+      bbox: 3-D float Tensor of bounding boxes arranged [1, num_boxes, coords]
+        where each coordinate is [0, 1) and the coordinates are arranged
+        as [ymin, xmin, ymax, xmax].
+      thread_id: integer indicating the preprocessing thread.
+      scope: Optional scope for name_scope.
+    Returns:
+      3-D float Tensor of distorted image used for training.
+    """
+    with tf.name_scope(values=[image, height, width, bbox], name=scope,
+                       default_name='distort_image'):
+      # Each bounding box has shape [1, num_boxes, box coords] and
+      # the coordinates are ordered [ymin, xmin, ymax, xmax].
+
+      # Display the bounding box in the first thread only.
+      if not thread_id:
+        image_with_box = tf.image.draw_bounding_boxes(tf.expand_dims(image, 0),
+                                                      bbox)
+        tf.summary.image('image_with_bounding_boxes', image_with_box)
+
+    # A large fraction of image datasets contain a human-annotated bounding
+    # box delineating the region of the image containing the object of interest.
+    # We choose to create a new bounding box for the object which is a randomly
+    # distorted version of the human-annotated bounding box that obeys an allowed
+    # range of aspect ratios, sizes and overlap with the human-annotated
+    # bounding box. If no box is supplied, then we assume the bounding box is
+    # the entire image.
+      sample_distorted_bounding_box = tf.image.sample_distorted_bounding_box(
+          tf.shape(image),
+          bounding_boxes=bbox,
+          min_object_covered=0.1,
+          aspect_ratio_range=[0.75, 1.33],
+          area_range=[0.05, 1.0],
+          max_attempts=100,
+          use_image_if_no_bounding_boxes=True)
+      bbox_begin, bbox_size, distort_bbox = sample_distorted_bounding_box
+      if not thread_id:
+        image_with_distorted_box = tf.image.draw_bounding_boxes(
+            tf.expand_dims(image, 0), distort_bbox)
+        tf.summary.image('images_with_distorted_bounding_box',
+                         image_with_distorted_box)
+
+      # Crop the image to the specified bounding box.
+      distorted_image = tf.slice(image, bbox_begin, bbox_size)
+
+      # This resizing operation may distort the images because the aspect
+      # ratio is not respected. We select a resize method in a round robin
+      # fashion based on the thread number.
+      # Note that ResizeMethod contains 4 enumerated resizing methods.
+      resize_method = thread_id % 4
+      distorted_image = tf.image.resize_images(distorted_image, [height, width],
+                                               method=resize_method)
+      # Restore the shape since the dynamic slice based upon the bbox_size loses
+      # the third dimension.
+      distorted_image.set_shape([height, width, 3])
+      if not thread_id:
+        tf.summary.image('cropped_resized_image',
+                         tf.expand_dims(distorted_image, 0))
+
+      # Randomly flip the image horizontally.
+      distorted_image = tf.image.random_flip_left_right(distorted_image)
+
+      # Randomly distort the colors.
+      distorted_image = self.distort_color(distorted_image, thread_id)
+
+      if not thread_id:
+        tf.summary.image('final_distorted_image',
+                         tf.expand_dims(distorted_image, 0))
+      return distorted_image
+
+
+  def case_arm(self, arm_value, input_value, image):
+    arm = tf.equal(tf.constant(arm_value), input_value)
+    bbox = tf.constant([[[0., 0., 1., 1.]]])
+    image = self.distort_image(image, self.HEIGHT, self.WIDTH, bbox, arm_value)
+    return arm, lambda: image
+    
   def build_graph(self):
     """Forms the core by building a wrapper around the inception graph.
 
@@ -230,22 +362,28 @@ class EmbeddingsGraph(object):
       embedding: The embeddings tensor, that will be materialized later.
     """
 
+    distorted_version = tf.placeholder(tf.int32, name='distorted_version')
     input_jpeg = tf.placeholder(tf.string, shape=None)
     image = tf.image.decode_jpeg(input_jpeg, channels=self.CHANNELS)
 
-    # Note resize expects a batch_size, but we are feeding a single image.
-    # So we have to expand then squeeze.  Resize returns float32 in the
-    # range [0, uint8_max]
-    image = tf.expand_dims(image, 0)
-
     # convert_image_dtype also scales [0, uint8_max] -> [0 ,1).
     image = tf.image.convert_image_dtype(image, dtype=tf.float32)
-    image = tf.image.resize_bilinear(
-        image, [self.HEIGHT, self.WIDTH], align_corners=False)
+
+    # distort based on distorted_version
+    case_arms = [ self.case_arm(x, distorted_version, image) 
+                  for x in range(4) ]
+    image = tf.case(case_arms, default=lambda: image, exclusive=True)
+    image.set_shape([self.HEIGHT, self.WIDTH, self.CHANNELS])
+
 
     # Then rescale range to [-1, 1) for Inception.
     image = tf.subtract(image, 0.5)
     inception_input = tf.multiply(image, 2.0)
+
+    # Note resize expects a batch_size, but we are feeding a single image.
+    # So we have to expand then squeeze.  Resize returns float32 in the
+    # range [0, uint8_max]
+    inception_input = tf.expand_dims(inception_input, 0)
 
     # Build Inception layers, which expect a tensor of type float from [-1, 1)
     # and shape [batch_size, height, width, channels].
@@ -253,7 +391,7 @@ class EmbeddingsGraph(object):
       _, end_points = inception.inception_v3(inception_input, is_training=False)
 
     embedding = end_points['PreLogits']
-    return input_jpeg, embedding
+    return input_jpeg, distorted_version, embedding
 
   def restore_from_checkpoint(self, checkpoint_path):
     """To restore inception model variables from the checkpoint file.
@@ -273,7 +411,7 @@ class EmbeddingsGraph(object):
     saver = tf.train.Saver(all_vars)
     saver.restore(self.tf_session, checkpoint_path)
 
-  def calculate_embedding(self, batch_image_bytes):
+  def calculate_embedding(self, batch_image_bytes, distorted_version=0):
     """Get the embeddings for a given JPEG image.
 
     Args:
@@ -283,7 +421,8 @@ class EmbeddingsGraph(object):
       The Inception embeddings (bottleneck layer output)
     """
     return self.tf_session.run(
-        self.embedding, feed_dict={self.input_jpeg: batch_image_bytes})
+        self.embedding, feed_dict={self.input_jpeg: batch_image_bytes,
+                                   self.distorted_version: distorted_version})
 
 
 class TFExampleFromImageDoFn(beam.DoFn):
@@ -300,10 +439,11 @@ class TFExampleFromImageDoFn(beam.DoFn):
                      stored.
   """
 
-  def __init__(self):
+  def __init__(self, distort_images=False):
     self.tf_session = None
     self.graph = None
     self.preprocess_graph = None
+    self.distort_image_count = 4 if distort_images else 1
 
   def start_bundle(self, context=None):
     # There is one tensorflow session per instance of TFExampleFromImageDoFn.
@@ -330,28 +470,31 @@ class TFExampleFromImageDoFn(beam.DoFn):
       pass
     uri, label_ids, image_bytes = element
 
-    try:
-      embedding = self.preprocess_graph.calculate_embedding(image_bytes)
-    except errors.InvalidArgumentError as e:
-      incompatible_image.inc()
-      logging.warning('Could not encode an image from %s: %s', uri, str(e))
-      return
+    for version in range(self.distort_image_count):
+      try:
+        embedding = self.preprocess_graph.calculate_embedding(
+          image_bytes, self.distort_image_count)
+      except errors.InvalidArgumentError as e:
+        incompatible_image.inc()
+        print('Could not encode an image from %s: %s' % (uri, str(e)))
+        logging.warning('Could not encode an image from %s: %s', uri, str(e))
+        return
 
-    if embedding.any():
-      embedding_good.inc()
-    else:
-      embedding_bad.inc()
+      if embedding.any():
+        embedding_good.inc()
+      else:
+        embedding_bad.inc()
 
-    example = tf.train.Example(features=tf.train.Features(feature={
+      example = tf.train.Example(features=tf.train.Features(feature={
         'image_uri': _bytes_feature([uri]),
         'embedding': _float_feature(embedding.ravel().tolist()),
-    }))
+      }))
 
-    if label_ids:
-      label_ids.sort()
-      example.features.feature['label'].int64_list.value.extend(label_ids)
+      if label_ids:
+        label_ids.sort()
+        example.features.feature['label'].int64_list.value.extend(label_ids)
 
-    yield example
+      yield example
 
 
 def configure_pipeline(p, opt):
@@ -368,7 +511,8 @@ def configure_pipeline(p, opt):
                                            beam.pvalue.AsIter(labels))
        | 'Read and convert to JPEG'
        >> beam.ParDo(ReadImageAndConvertToJpegDoFn())
-       | 'Embed and make TFExample' >> beam.ParDo(TFExampleFromImageDoFn())
+       | 'Embed and make TFExample'
+       >> beam.ParDo(TFExampleFromImageDoFn(opt.distort_images))
        # TODO(b/35133536): Get rid of this Map and instead use
        # coder=beam.coders.ProtoCoder(tf.train.Example) in WriteToTFRecord
        # below.
