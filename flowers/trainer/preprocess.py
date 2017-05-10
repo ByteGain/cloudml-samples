@@ -178,7 +178,6 @@ class ReadImageAndConvertToJpegDoFn(beam.DoFn):
         print("error reading file %s" % uri)
         return file_io.FileIO(uri, mode='r')
 
-    print("read %s" % uri)
     try:
       with _open_file_read_binary(uri) as f:
         image_bytes = f.read()
@@ -370,8 +369,10 @@ class EmbeddingsGraph(object):
     image = tf.image.convert_image_dtype(image, dtype=tf.float32)
 
     # distort based on distorted_version
-    case_arms = [ self.case_arm(x, distorted_version, image) 
-                  for x in range(4) ]
+    case_arms = {}
+    for x in range(4):
+      guard, value = self.case_arm(x, distorted_version, image)
+      case_arms[guard] = value
     image = tf.case(case_arms, default=lambda: image, exclusive=True)
     image.set_shape([self.HEIGHT, self.WIDTH, self.CHANNELS])
 
@@ -473,7 +474,7 @@ class TFExampleFromImageDoFn(beam.DoFn):
     for version in range(self.distort_image_count):
       try:
         embedding = self.preprocess_graph.calculate_embedding(
-          image_bytes, self.distort_image_count)
+          image_bytes, version)
       except errors.InvalidArgumentError as e:
         incompatible_image.inc()
         print('Could not encode an image from %s: %s' % (uri, str(e)))

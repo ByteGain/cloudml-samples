@@ -196,8 +196,11 @@ class FlowersE2E(object):
                  eval_output_prefix, dataflow_sdk, trainer_uri)
 
     # make a pool to run two pipelines in parallel.
-    pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args),
-                     thread_pool.apply_async(self.run_pipeline, eval_args)]
+    #pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args),
+    #                 thread_pool.apply_async(self.run_pipeline, eval_args)]
+    pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args)]
+    _ = [res.get() for res in pipeline_pool]
+    pipeline_pool = [thread_pool.apply_async(self.run_pipeline, eval_args)]
     _ = [res.get() for res in pipeline_pool]
     return train_output_prefix, eval_output_prefix
 
@@ -257,7 +260,8 @@ class FlowersE2E(object):
         '--eval_data_paths', eval_file_path,
         '--eval_set_size', str(self.args.eval_set_size),
         '--train_data_paths', train_file_path,
-        '--max_steps', "5000",
+        '--batch_size', "10",
+        '--max_steps', "151",
     ]
 
     if self.args.cloud:
@@ -281,6 +285,7 @@ class FlowersE2E(object):
           '--package-path', 'trainer',
           '--',
       ] + trainer_args
+    print("subprocess call %s" % " ".join(command))
     subprocess.check_call(command)
 
   def deploy_model(self, model_path):
