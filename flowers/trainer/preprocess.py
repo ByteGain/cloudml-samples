@@ -104,8 +104,8 @@ class Default(object):
   # inception graph or when a newer checkpoint file is available. See
   # https://research.googleblog.com/2016/08/improving-inception-and-image.html
   IMAGE_GRAPH_CHECKPOINT_URI = (
-#       '/Users/mtv/data3/9gag/inception_v3_2016_08_28.ckpt')
-      'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt')
+       '/Users/mtv/data3/9gag/inception_v3_2016_08_28.ckpt')
+#      'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt')
 
 
 class ExtractLabelIdsDoFn(beam.DoFn):
@@ -287,30 +287,30 @@ class EmbeddingsGraph(object):
                                                       bbox)
         tf.summary.image('image_with_bounding_boxes', image_with_box)
 
-    # A large fraction of image datasets contain a human-annotated bounding
-    # box delineating the region of the image containing the object of interest.
-    # We choose to create a new bounding box for the object which is a randomly
-    # distorted version of the human-annotated bounding box that obeys an allowed
-    # range of aspect ratios, sizes and overlap with the human-annotated
-    # bounding box. If no box is supplied, then we assume the bounding box is
-    # the entire image.
-      sample_distorted_bounding_box = tf.image.sample_distorted_bounding_box(
+      if thread_id:
+        # A large fraction of image datasets contain a human-annotated bounding
+        # box delineating the region of the image containing the object of interest.
+        # We choose to create a new bounding box for the object which is a randomly
+        # distorted version of the human-annotated bounding box that obeys an allowed
+        # range of aspect ratios, sizes and overlap with the human-annotated
+        # bounding box. If no box is supplied, then we assume the bounding box is
+        # the entire image.
+        sample_distorted_bounding_box = tf.image.sample_distorted_bounding_box(
           tf.shape(image),
           bounding_boxes=bbox,
           min_object_covered=0.1,
           aspect_ratio_range=[0.75, 1.33],
-          area_range=[0.05, 1.0],
+          #area_range=[0.05, 1.0],
+          area_range=[0.50, 1.0],
           max_attempts=100,
           use_image_if_no_bounding_boxes=True)
-      bbox_begin, bbox_size, distort_bbox = sample_distorted_bounding_box
-      if not thread_id:
-        image_with_distorted_box = tf.image.draw_bounding_boxes(
-            tf.expand_dims(image, 0), distort_bbox)
-        tf.summary.image('images_with_distorted_bounding_box',
-                         image_with_distorted_box)
+        bbox_begin, bbox_size, distort_bbox = sample_distorted_bounding_box
 
-      # Crop the image to the specified bounding box.
-      distorted_image = tf.slice(image, bbox_begin, bbox_size)
+        # Crop the image to the specified bounding box.
+        distorted_image = tf.slice(image, bbox_begin, bbox_size)
+
+      else: # not thread_id:
+        distorted_image = image
 
       # This resizing operation may distort the images because the aspect
       # ratio is not respected. We select a resize method in a round robin
@@ -322,17 +322,17 @@ class EmbeddingsGraph(object):
       # Restore the shape since the dynamic slice based upon the bbox_size loses
       # the third dimension.
       distorted_image.set_shape([height, width, 3])
+
       if not thread_id:
         tf.summary.image('cropped_resized_image',
                          tf.expand_dims(distorted_image, 0))
 
-      # Randomly flip the image horizontally.
-      distorted_image = tf.image.random_flip_left_right(distorted_image)
+        # Randomly flip the image horizontally.
+        distorted_image = tf.image.random_flip_left_right(distorted_image)
 
-      # Randomly distort the colors.
-      distorted_image = self.distort_color(distorted_image, thread_id)
+        # Randomly distort the colors.
+        distorted_image = self.distort_color(distorted_image, thread_id)
 
-      if not thread_id:
         tf.summary.image('final_distorted_image',
                          tf.expand_dims(distorted_image, 0))
       return distorted_image
@@ -370,7 +370,7 @@ class EmbeddingsGraph(object):
 
     # distort based on distorted_version
     case_arms = {}
-    for x in range(4):
+    for x in range(8):
       guard, value = self.case_arm(x, distorted_version, image)
       case_arms[guard] = value
     image = tf.case(case_arms, default=lambda: image, exclusive=True)
@@ -444,7 +444,7 @@ class TFExampleFromImageDoFn(beam.DoFn):
     self.tf_session = None
     self.graph = None
     self.preprocess_graph = None
-    self.distort_image_count = 4 if distort_images else 1
+    self.distort_image_count = 8 if distort_images else 1
 
   def start_bundle(self, context=None):
     # There is one tensorflow session per instance of TFExampleFromImageDoFn.
