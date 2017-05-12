@@ -95,6 +95,7 @@ invalid_uri = Metrics.counter('main', 'invalid_file_name')
 unlabeled_image = Metrics.counter('main', 'unlabeled_image')
 unknown_label = Metrics.counter('main', 'unknown_label')
 
+DISTORT_IMAGE_COUNT = 12
 
 class Default(object):
   """Default values of variables."""
@@ -370,7 +371,7 @@ class EmbeddingsGraph(object):
 
     # distort based on distorted_version
     case_arms = {}
-    for x in range(8):
+    for x in range(DISTORT_IMAGE_COUNT):
       guard, value = self.case_arm(x, distorted_version, image)
       case_arms[guard] = value
     image = tf.case(case_arms, default=lambda: image, exclusive=True)
@@ -444,7 +445,7 @@ class TFExampleFromImageDoFn(beam.DoFn):
     self.tf_session = None
     self.graph = None
     self.preprocess_graph = None
-    self.distort_image_count = 8 if distort_images else 1
+    self.distort_image_count = DISTORT_IMAGE_COUNT if distort_images else 1
 
   def start_bundle(self, context=None):
     # There is one tensorflow session per instance of TFExampleFromImageDoFn.
