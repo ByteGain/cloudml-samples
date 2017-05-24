@@ -95,7 +95,7 @@ invalid_uri = Metrics.counter('main', 'invalid_file_name')
 unlabeled_image = Metrics.counter('main', 'unlabeled_image')
 unknown_label = Metrics.counter('main', 'unknown_label')
 
-DISTORT_IMAGE_COUNT = 12
+DISTORT_IMAGE_COUNT = 6
 
 class Default(object):
   """Default values of variables."""
@@ -105,8 +105,8 @@ class Default(object):
   # inception graph or when a newer checkpoint file is available. See
   # https://research.googleblog.com/2016/08/improving-inception-and-image.html
   IMAGE_GRAPH_CHECKPOINT_URI = (
-       '/Users/mtv/data3/9gag/inception_v3_2016_08_28.ckpt')
-#      'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt')
+#       '/Users/mtv/data3/9gag/inception_v3_2016_08_28.ckpt')
+      'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt')
 
 
 class ExtractLabelIdsDoFn(beam.DoFn):

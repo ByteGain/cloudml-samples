@@ -21,6 +21,7 @@ import datetime
 import errno
 import io
 import json
+import logging
 import multiprocessing
 import os
 import subprocess
@@ -61,28 +62,26 @@ def process_args():
       default=None,
       help='The project to which the job will be submitted.')
   parser.add_argument(
+      '--batch_size',
+      default=10,
+      help='The batch size for training.')
+  parser.add_argument(
       '--cloud', action='store_true',
       help='Run preprocessing on the cloud.')
+  parser.add_argument(
+      '--data_dir',
+      help='Dir containing config files metadata.json, train.csv, eval.csv,'
+      ' and dict.txt.'
+      ' When running in cloud, a parallel dir in --gcs_bucket must exist.',
+      default=None,
+      required=True)
   parser.add_argument(
       '--debug_run', action='store_true',
       help='Stop after preprocessing')
   parser.add_argument(
-      '--train_input_path',
-      default=None,
-      help='Input specified as uri to CSV file for the train set')
-  parser.add_argument(
-      '--eval_input_path',
-      default=None,
-      help='Input specified as uri to CSV file for the eval set.')
-  parser.add_argument(
       '--eval_set_size',
       default=50,
       help='The size of the eval dataset.')
-  parser.add_argument(
-      '--input_dict',
-      default=None,
-      help='Input dictionary. Specified as text file uri. '
-      'Each line of the file stores one label.')
   parser.add_argument(
       '--deploy_model_name',
       default='flowerse2e',
@@ -98,22 +97,14 @@ def process_args():
       default=600,
       help=('Maximum number of seconds to wait after a model is deployed.'))
   parser.add_argument(
+      '--max_steps',
+      default=None,
+      help=('Maximum number of steps for training; absent means on epoch.'))
+  parser.add_argument(
       '--deploy_model_version',
       default='v' + uuid.uuid4().hex[:4],
       help=('If --cloud is used, the model is deployed with this '
             'version. The default is four random characters.'))
-  parser.add_argument(
-      '--preprocessed_train_set',
-      default=None,
-      help=('If specified, preprocessing steps will be skipped.'
-            'The provided preprocessed dataset wil be used in this case.'
-            'If specified, preprocessed_eval_set must also be provided.'))
-  parser.add_argument(
-      '--preprocessed_eval_set',
-      default=None,
-      help=('If specified, preprocessing steps will be skipped.'
-            'The provided preprocessed dataset wil be used in this case.'
-            'If specified, preprocessed_train_set must also be provided.'))
   parser.add_argument(
       '--pretrained_model_path',
       default=None,
@@ -146,14 +137,46 @@ def process_args():
   return args
 
 
+def uri_path_exists(filespec):
+  if filespec.startswith("gs://"):
+    from bytegain.data_import.segment_utils import parse_s3_url
+    from google.cloud import storage
+    client = storage.Client()
+    bucket_name, key, _ = parse_s3_url(filespec)
+    bucket = client.get_bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=key)
+    matches = [blob for blob in blobs]
+    print("matches %s" % str(matches))
+    return len(matches) > 0
+  else:
+    return os.path.exists(filespec)
+
 class FlowersE2E(object):
   """The end-2-end pipeline for Flowers Sample."""
 
   def  __init__(self, args=None):
     if not args:
       self.args = process_args()
+      with open(os.path.join(self.args.data_dir, METADATA_FILE_NAME), 'r') as f:
+        self.metadata = json.loads(f.read())
     else:
       self.args = args
+
+  def config_dir(self):
+    if self.args.cloud:
+      return os.path.join(self.args.gcs_bucket, 
+                          os.path.basename(self.args.data_dir))
+    else:
+      return self.args.data_dir
+
+  def train_input_path(self):
+    return os.path.join(self.config_dir(), 'train.csv')
+
+  def eval_input_path(self):
+    return os.path.join(self.config_dir(), 'eval.csv')
+
+  def input_dict(self):
+    return os.path.join(self.config_dir(), 'dict.txt')
 
   def preprocess(self):
     """Runs the pre-processing pipeline.
@@ -190,18 +213,21 @@ class FlowersE2E(object):
     eval_output_prefix = os.path.join(self.args.output_dir, 'preprocessed',
                                       eval_dataset_name)
 
-    train_args = (train_dataset_name, self.args.train_input_path,
+    train_args = (train_dataset_name, self.train_input_path(),
                   train_output_prefix, dataflow_sdk, trainer_uri)
-    eval_args = (eval_dataset_name, self.args.eval_input_path,
+    eval_args = (eval_dataset_name, self.eval_input_path(),
                  eval_output_prefix, dataflow_sdk, trainer_uri)
 
     # make a pool to run two pipelines in parallel.
-    #pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args),
-    #                 thread_pool.apply_async(self.run_pipeline, eval_args)]
-    pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args)]
-    _ = [res.get() for res in pipeline_pool]
-    pipeline_pool = [thread_pool.apply_async(self.run_pipeline, eval_args)]
-    _ = [res.get() for res in pipeline_pool]
+    if self.args.cloud:
+      pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args),
+                       thread_pool.apply_async(self.run_pipeline, eval_args)]
+      _ = [res.get() for res in pipeline_pool]
+    else:
+      pipeline_pool = [thread_pool.apply_async(self.run_pipeline, train_args)]
+      _ = [res.get() for res in pipeline_pool]
+      pipeline_pool = [thread_pool.apply_async(self.run_pipeline, eval_args)]
+      _ = [res.get() for res in pipeline_pool]
     return train_output_prefix, eval_output_prefix
 
   def run_pipeline(self, dataset_name, input_csv, output_prefix,
@@ -231,6 +257,9 @@ class FlowersE2E(object):
         'extra_packages': [trainer_uri],
         'save_main_session':
             True,
+      #'worker_machine_type': 'n1-highcpu-16',
+        'num_workers': 16,
+        'autoscaling_algorithm': 'NONE',
     }
     if dataflow_sdk_location:
       options['sdk_location'] = dataflow_sdk_location
@@ -240,7 +269,7 @@ class FlowersE2E(object):
     opts = beam.pipeline.PipelineOptions(flags=[], **options)
     args = argparse.Namespace(**vars(self.args))
     vars(args)['input_path'] = input_csv
-    vars(args)['input_dict'] = self.args.input_dict
+    vars(args)['input_dict'] = self.input_dict()
     vars(args)['output_path'] = output_prefix
     vars(args)['distort_images'] = (dataset_name == 'train')
     
@@ -255,13 +284,23 @@ class FlowersE2E(object):
       train_file_path: Path to the train dataset.
       eval_file_path: Path to the eval dataset.
     """
+    if self.args.max_steps is None:
+        print("metadata is %s" % str(self.metadata))
+        max_steps = int(self.metadata['num_train'] * 1.0 * preprocess_lib.DISTORT_IMAGE_COUNT /
+                        int(self.args.batch_size))
+    else:
+        max_steps = self.args.max_steps 
     trainer_args = [
         '--output_path', self.args.output_dir,
         '--eval_data_paths', eval_file_path,
-        '--eval_set_size', str(self.args.eval_set_size),
+        '--eval_set_size', str(self.metadata['num_validate']),
         '--train_data_paths', train_file_path,
-        '--batch_size', "10",
-        '--max_steps', "151",
+        '--batch_size', str(self.args.batch_size),
+        '--max_steps', str(max_steps),
+        '--dropout', "0.26",
+        '--eval_interval_secs', "2",
+        '--min_train_eval_rate', "1",
+#        '--write_predictions',
     ]
 
     if self.args.cloud:
@@ -382,20 +421,31 @@ class FlowersE2E(object):
         outf.write(row)
         outf.write('\n')
 
+  def preprocessed_sets(self):
+    preprocessed_dir = os.path.join(self.config_dir(), 'output', 'preprocessed')
+    if uri_path_exists(preprocessed_dir):
+      return (os.path.join(preprocessed_dir, 'train'),
+              os.path.join(preprocessed_dir, 'eval'))
+    else:
+      return (None, None)
+
   def run(self):
     """Runs the pipeline."""
     model_path = self.args.pretrained_model_path
+    print("model_path %s" % model_path)
     if not model_path:
-      train_prefix, eval_prefix = (self.args.preprocessed_train_set,
-                                   self.args.preprocessed_eval_set)
-
+      train_prefix, eval_prefix = self.preprocessed_sets()
       if not train_prefix or not eval_prefix:
+        print("calling preprocess")
         train_prefix, eval_prefix = self.preprocess()
+      print("preprocess done")
       if self.args.debug_run:
         print("Exiting after preprocess for --debug_run")
         return
       self.train(train_prefix + '*', eval_prefix + '*')
       model_path = os.path.join(self.args.output_dir, EXPORT_SUBDIRECTORY)
+    print("skipping deploy...")
+    return
     self.deploy_model(model_path)
 
 
@@ -423,6 +473,7 @@ def get_cloud_project():
 
 
 def main():
+  logging.getLogger().setLevel(logging.INFO)
   pipeline = FlowersE2E()
   pipeline.run()
 
