@@ -25,6 +25,7 @@ import logging
 import multiprocessing
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 import apache_beam as beam
@@ -146,7 +147,6 @@ def uri_path_exists(filespec):
     bucket = client.get_bucket(bucket_name)
     blobs = bucket.list_blobs(prefix=key)
     matches = [blob for blob in blobs]
-    print("matches %s" % str(matches))
     return len(matches) > 0
   else:
     return os.path.exists(filespec)
@@ -277,6 +277,48 @@ class FlowersE2E(object):
     with beam.Pipeline(pipeline_name, options=opts) as pipeline:
       preprocess_lib.configure_pipeline(pipeline, args)
 
+  def create_training_config(self):
+    # Add hyperparameter tuning to the job config.
+    hyperparams = {
+      'goal': 'MAXIMIZE',
+      'maxTrials': 30,
+      'maxParallelTrials': 5,
+      'params': [],
+      'hyperparameterMetricTag': 'accuracy',
+    }
+
+#    hyperparams['params'].append({
+#      'parameterName':'epochs',
+#      'type':'DISCRETE',
+#      'discreteValues': [1, 2, 3, 4, 5],
+#    })
+
+#    hyperparams['params'].append({
+#      'parameterName':'dropout',
+#      'type':'DOUBLE',
+#      'minValue': 0.05,
+#      'maxValue': 0.5,
+#      'scaleType': 'UNIT_LINEAR_SCALE',
+#    })
+
+    hyperparams['params'].append({
+      'parameterName':'batch_size',
+      'type':'DISCRETE',
+      'discreteValues': [4, 8, 16, 32, 64],
+    })
+
+    # Build the job spec.
+    job_spec = { 
+      'jobId': 'gcp_model' + datetime.datetime.now().strftime('_%y%m%d_%H%M%S'),
+      'trainingInput': {
+        'scaleTier': 'BASIC',
+        'packageUris': [],
+        'pythonModule': MODULE_NAME,
+        'hyperparameters': hyperparams,
+      }
+    }
+    return job_spec
+
   def train(self, train_file_path, eval_file_path):
     """Train a model using the eval and train datasets.
 
@@ -284,30 +326,30 @@ class FlowersE2E(object):
       train_file_path: Path to the train dataset.
       eval_file_path: Path to the eval dataset.
     """
-    if self.args.max_steps is None:
-        print("metadata is %s" % str(self.metadata))
-        max_steps = int(self.metadata['num_train'] * 1.0 * preprocess_lib.DISTORT_IMAGE_COUNT /
-                        int(self.args.batch_size))
-    else:
-        max_steps = self.args.max_steps 
+
     trainer_args = [
+        '--num_train', str(self.metadata['num_train'] * preprocess_lib.DISTORT_IMAGE_COUNT),
         '--output_path', self.args.output_dir,
         '--eval_data_paths', eval_file_path,
         '--eval_set_size', str(self.metadata['num_validate']),
         '--train_data_paths', train_file_path,
-        '--batch_size', str(self.args.batch_size),
-        '--max_steps', str(max_steps),
+#        '--batch_size', str(self.args.batch_size),
+        '--epochs', "1",
         '--dropout', "0.26",
-        '--eval_interval_secs', "2",
-        '--min_train_eval_rate', "1",
+#        '--eval_interval_secs', "2",
+#        '--min_train_eval_rate', "1",
 #        '--write_predictions',
     ]
 
     if self.args.cloud:
-      job_name = 'flowers_model' + datetime.datetime.now().strftime(
-          '_%y%m%d_%H%M%S')
+      config = self.create_training_config()
+      config_fd, config_fname = tempfile.mkstemp()
+      with os.fdopen(config_fd, 'w') as config_file:
+        config_file.write(json.dumps(config))
+      job_name = config['jobId']
       command = [
           'gcloud', 'ml-engine', 'jobs', 'submit', 'training', job_name,
+        '--config', config_fname,
           '--stream-logs',
           '--module-name', MODULE_NAME,
           '--staging-bucket', self.args.gcs_bucket,

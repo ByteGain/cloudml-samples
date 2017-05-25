@@ -127,9 +127,12 @@ class Evaluator(object):
           res = session.run(to_run)
           for element in range(len(res[0])):
             f.write('%s' % res[0][element])
-            for prediction in res[1:]:
-              f.write(',')
-              f.write(str(prediction[element]))
+            predicted_category = res[1][element]
+            f.write(',%d' % predicted_category)
+            f.write(',%4.2f' % res[2][element][predicted_category])
+            #for prediction in res[1:]:
+            #  f.write(',')
+            #  f.write(str(prediction[element]))
             f.write('\n')
 
 
@@ -179,6 +182,9 @@ class Trainer(object):
       device_fn = ''
       config = None
 
+    logging.info("Batch size is %s", str(self.args.batch_size))
+    logging.info("epochs is %s", str(self.args.epochs))
+
     with tf.Graph().as_default() as graph:
       with tf.device(device_fn):
         # Build the training graph.
@@ -219,9 +225,9 @@ class Trainer(object):
           self.local_step = self.last_local_step = 0
           self.last_global_time = self.last_local_time = start_time
 
-          # Loop until the supervisor shuts down or args.max_steps have
+          # Loop until the supervisor shuts down or max_steps have
           # completed.
-          max_steps = self.args.max_steps
+          max_steps = int(self.args.epochs * self.args.num_train * 1.0 / self.args.batch_size)
           while not self.sv.should_stop() and self.global_step < max_steps:
             try:
               # Run one step of the model.
@@ -286,10 +292,10 @@ class Trainer(object):
     # Make sure eval doesn't consume too much of total time.
     eval_time = now - eval_start
     train_eval_rate = self.eval_interval / eval_time
-    if train_eval_rate < self.min_train_eval_rate and self.last_save > 0:
-      logging.info('Adjusting eval interval from %.2fs to %.2fs',
-                   self.eval_interval, self.min_train_eval_rate * eval_time)
-      self.eval_interval = self.min_train_eval_rate * eval_time
+    #if train_eval_rate < self.min_train_eval_rate and self.last_save > 0:
+    #  logging.info('Adjusting eval interval from %.2fs to %.2fs',
+    #               self.eval_interval, self.min_train_eval_rate * eval_time)
+    #  self.eval_interval = self.min_train_eval_rate * eval_time
 
     self.last_save = now
     self.last_log = now
@@ -327,8 +333,15 @@ def run(model, argv):
       'should be saved. This can be either a local or GCS '
       'path.')
   parser.add_argument(
-      '--max_steps',
-      type=int,)
+      '--epochs',
+      type=int,
+      help='The number of epochs to train.',
+      default=1)
+  parser.add_argument(
+      '--num_train',
+      type=int,
+      help='The number of training examples.',
+      required=True)
   parser.add_argument(
       '--batch_size',
       type=int,
@@ -403,6 +416,7 @@ def run(model, argv):
 
   # Print the job data as provided by the service.
   logging.info('Original job data: %s', env.get('job', {}))
+  logging.info('epochs is %d', args.epochs)
 
   # First find out if there's a task value on the environment variable.
   # If there is none or it is empty define a default one.
